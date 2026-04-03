@@ -914,6 +914,8 @@ const (
 
 	CompressionAssignValue = 0x1C0FE323
 	CompressionCloseValue  = 0x1C0FE324
+
+	maxProxyDatagramPayloadSize = 64 * 1024
 )
 
 var (
@@ -958,6 +960,12 @@ func (data *Datagram) ReceiveBuffer(r io.Reader, b []byte) error {
 	data.Length, err = quicvarint.Read(rr)
 	if err != nil {
 		return fmt.Errorf("receive datagram length error: %w", err)
+	}
+	if data.Length > maxProxyDatagramPayloadSize {
+		return fmt.Errorf("datagram payload too large: %d", data.Length)
+	}
+	if data.Length > uint64(len(b)) {
+		b = make([]byte, data.Length)
 	}
 
 	bb := b[:data.Length]
@@ -1065,16 +1073,25 @@ func (data *UncompressedPayload) Parse(b []byte) error {
 	if err != nil {
 		return err
 	}
+	if nr >= len(b) {
+		return io.ErrUnexpectedEOF
+	}
 
 	data.ContextID = id
 
 	switch b[nr] { // IPVersion
 	case 4:
+		if nr+7 > len(b) {
+			return io.ErrUnexpectedEOF
+		}
 		data.IPVersion = 4
 		data.Addr = netip.AddrFrom4([4]byte{b[nr+1], b[nr+2], b[nr+3], b[nr+4]})
 		data.Port = uint16(b[nr+5])<<8 | uint16(b[nr+6])
 		data.Payload = b[nr+7:]
 	case 6:
+		if nr+19 > len(b) {
+			return io.ErrUnexpectedEOF
+		}
 		data.IPVersion = 6
 		data.Addr = netip.AddrFrom16(
 			[16]byte{b[nr+1], b[nr+2], b[nr+3], b[nr+4],
@@ -1125,6 +1142,9 @@ func (data *CompressionAssignPayload) Parse(b []byte) error {
 	if err != nil {
 		return err
 	}
+	if nr >= len(b) {
+		return io.ErrUnexpectedEOF
+	}
 
 	data.ContextID = id
 
@@ -1132,10 +1152,16 @@ func (data *CompressionAssignPayload) Parse(b []byte) error {
 	case 0:
 		data.IPVersion = 0
 	case 4:
+		if nr+7 > len(b) {
+			return io.ErrUnexpectedEOF
+		}
 		data.IPVersion = 4
 		data.Addr = netip.AddrFrom4([4]byte{b[nr+1], b[nr+2], b[nr+3], b[nr+4]})
 		data.Port = uint16(b[nr+5])<<8 | uint16(b[nr+6])
 	case 6:
+		if nr+19 > len(b) {
+			return io.ErrUnexpectedEOF
+		}
 		data.IPVersion = 6
 		data.Addr = netip.AddrFrom16(
 			[16]byte{b[nr+1], b[nr+2], b[nr+3], b[nr+4],
@@ -1323,21 +1349,11 @@ func (nm *PacketConn) ReadPacket(b []byte) ([]byte, netip.AddrPort, error) {
 					// ignore all packets with conext id set as 2 when assign close is set
 					continue
 				}
-				switch bb[1] {
-				case 4:
-					// nr = 1
-					return bb[8:], netip.AddrPortFrom(netip.AddrFrom4(
-						[4]byte{bb[2], bb[3], bb[4], bb[5]}), uint16(bb[6])<<8|uint16(bb[7])), nil
-				case 6:
-					// nr = 1
-					return bb[20:], netip.AddrPortFrom(netip.AddrFrom16(
-						[16]byte{bb[2], bb[3], bb[4], bb[5],
-							bb[6], bb[7], bb[8], bb[9],
-							bb[10], bb[11], bb[12], bb[13],
-							bb[14], bb[15], bb[16], bb[17]}), uint16(bb[18])<<8|uint16(bb[19])), nil
-				default:
-					return nil, netip.AddrPortFrom(netip.AddrFrom4([4]byte{}), 0), fmt.Errorf("ip version error: %v", bb[1])
+				pl := UncompressedPayload{}
+				if err := pl.Parse(bb); err != nil {
+					return nil, netip.AddrPortFrom(netip.AddrFrom4([4]byte{}), 0), err
 				}
+				return pl.Payload, netip.AddrPortFrom(pl.Addr, pl.Port), nil
 			}
 
 			addr, ok := nm.GetAddr(id)
@@ -1699,10 +1715,10 @@ func (srv udpProxyServer) ParseRequest(r *http.Request) (Request, error) {
 		if r.Method != http.MethodGet {
 			return "", fmt.Errorf("expected GET request, got %s", r.Method)
 		}
-		if hdr := r.Header.Get("Connection"); hdr != "Upgrade" {
+		if hdr := r.Header.Get("Connection"); !hasHeaderToken(hdr, "upgrade") {
 			return "", fmt.Errorf("unexpected Connection: %s", hdr)
 		}
-		if hdr := r.Header.Get("Upgrade"); hdr != RequestProtocol {
+		if hdr := r.Header.Get("Upgrade"); !strings.EqualFold(hdr, RequestProtocol) {
 			return "", fmt.Errorf("unexpected Upgrade: %s", hdr)
 		}
 	case 2:
@@ -1776,6 +1792,9 @@ func (srv udpProxyServer) ParseRequest(r *http.Request) (Request, error) {
 		return "", fmt.Errorf("expected target_host and target_port")
 	}
 	if targetHost == "*" && targetPortStr == "*" {
+		if isUDPBind && r.ProtoMajor == 3 {
+			return "", fmt.Errorf("connect-udp-bind over http3 is not supported yet")
+		}
 		if isUDPBind {
 			return "*", nil
 		}
@@ -1799,8 +1818,10 @@ func (h Handler) tryUDPoverHTTP(w http.ResponseWriter, r *http.Request) (bool, e
 	// parse request
 	req, err := h.udpProxyServer.ParseRequest(r)
 	if err != nil {
-		// slog.Error(fmt.Sprintf("parse request: %s", err.Error()))
-		return false, err
+		if isPotentialUDPOverHTTPRequest(r) {
+			return true, err
+		}
+		return false, nil
 	}
 
 	// slog.Info(fmt.Sprintf("handle UDP over HTTP request: ---> %s", req))
@@ -1860,7 +1881,7 @@ func (h Handler) tryUDPoverHTTP(w http.ResponseWriter, r *http.Request) (bool, e
 			return false, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
 		}(string(req))
 		if !ok {
-			return false, err
+			return true, err
 		}
 
 		raddr, err := net.ResolveUDPAddr("udp", string(req))
@@ -1880,7 +1901,7 @@ func (h Handler) tryUDPoverHTTP(w http.ResponseWriter, r *http.Request) (bool, e
 		// slog.Info(fmt.Sprintf("handle UDP over HTTP/1.1 request: ---> %s", req))
 
 		w.Header().Set("Connection", "Upgrade")
-		w.Header().Set("Upgrade:", RequestProtocol)
+		w.Header().Set("Upgrade", RequestProtocol)
 		w.Header().Set(http3.CapsuleProtocolHeader, CapsuleProtocolHeaderValue)
 		if req == "*" {
 			w.Header().Set(ConnectUDPBindHeader, ConnectUDPBindHeaderValue)
@@ -1933,6 +1954,30 @@ func (h Handler) tryUDPoverHTTP(w http.ResponseWriter, r *http.Request) (bool, e
 		return true, h.udpProxyServer.HandlePacket(w.(http3.HTTPStreamer).HTTPStream(), req, rconn)
 	default:
 		return false, nil
+	}
+}
+
+func hasHeaderToken(hdr string, token string) bool {
+	for _, part := range strings.Split(hdr, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), token) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPotentialUDPOverHTTPRequest(r *http.Request) bool {
+	switch r.ProtoMajor {
+	case 1:
+		return r.Method == http.MethodGet &&
+			hasHeaderToken(r.Header.Get("Connection"), "upgrade") &&
+			strings.EqualFold(r.Header.Get("Upgrade"), RequestProtocol)
+	case 2:
+		return r.Method == http.MethodConnect && strings.EqualFold(r.Header.Get(":protocol"), RequestProtocol)
+	case 3:
+		return r.Method == http.MethodConnect && strings.EqualFold(r.Proto, RequestProtocol)
+	default:
+		return false
 	}
 }
 

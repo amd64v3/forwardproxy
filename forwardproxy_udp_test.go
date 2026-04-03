@@ -56,6 +56,19 @@ func TestDatagram(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("reject oversize datagram payload", func(t *testing.T) {
+		buf := &bytes.Buffer{}
+		header := quicvarint.Append(quicvarint.Append([]byte{}, 0), maxProxyDatagramPayloadSize+1)
+		if _, err := buf.Write(header); err != nil {
+			t.Fatalf("write header error: %v", err)
+		}
+
+		var dg Datagram
+		if err := dg.ReceiveBuffer(buf, make([]byte, 32)); err == nil {
+			t.Fatal("expected oversized datagram error")
+		}
+	})
 }
 
 func TestCompressedPayload(t *testing.T) {
@@ -175,6 +188,15 @@ func TestUncompressedPayload(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("reject truncated payload", func(t *testing.T) {
+		pl := &UncompressedPayload{}
+		// context id=2 + ip version=4 without addr+port
+		err := pl.Parse([]byte{0x02, 0x04})
+		if err == nil {
+			t.Fatal("expected truncated payload error")
+		}
+	})
 }
 
 func TestCompressionAssign(t *testing.T) {
@@ -243,6 +265,15 @@ func TestCompressionAssign(t *testing.T) {
 			} else {
 				t.Errorf("context id want %v, get %v", tt.ContextID, pl.ContextID)
 			}
+		}
+	})
+
+	t.Run("reject truncated payload", func(t *testing.T) {
+		pl := &CompressionAssignPayload{}
+		// context id=2 + ip version=6 without addr+port
+		err := pl.Parse([]byte{0x02, 0x06})
+		if err == nil {
+			t.Fatal("expected truncated payload error")
 		}
 	})
 }
@@ -1090,22 +1121,6 @@ func TestParseRequst(t *testing.T) {
 						}(),
 					},
 					{
-						Method: http.MethodConnect,
-						URL: func() *url.URL {
-							u, _ := url.Parse("https://example.com/.well-known/masque/udp/*/*/")
-							return u
-						}(),
-						Proto:      RequestProtocol,
-						ProtoMajor: 3,
-						ProtoMinor: 0,
-						Header: func() http.Header {
-							header := http.Header{}
-							header.Set(http3.CapsuleProtocolHeader, CapsuleProtocolHeaderValue)
-							header.Set(ConnectUDPBindHeader, ConnectUDPBindHeaderValue)
-							return header
-						}(),
-					},
-					{
 						Method: http.MethodGet,
 						URL: func() *url.URL {
 							u, _ := url.Parse("https://example.com/.well-known/masque/udp/google.com/443/")
@@ -1145,7 +1160,6 @@ func TestParseRequst(t *testing.T) {
 					"1.2.3.4:1234",
 					"*",
 					"1.2.3.4:1234",
-					"*",
 					"google.com:443",
 					"[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:443",
 				},
@@ -1164,6 +1178,59 @@ func TestParseRequst(t *testing.T) {
 					t.Errorf("parse request error: %v, want: %s, get: %s", err, v.Request[i], req)
 				}
 			}
+		}
+	})
+
+	t.Run("accept connection token list", func(t *testing.T) {
+		srv, err := newUDPProxyServer("https://{host}/.well-known/masque/udp/{target_host}/{target_port}/", zap.NewNop())
+		if err != nil {
+			t.Fatalf("new proxy server error: %v", err)
+		}
+
+		req := &http.Request{
+			Method:     http.MethodGet,
+			ProtoMajor: 1,
+			ProtoMinor: 1,
+			Header: http.Header{
+				"Connection": []string{"keep-alive, Upgrade"},
+				"Upgrade":    []string{RequestProtocol},
+			},
+			URL: func() *url.URL {
+				u, _ := url.Parse("https://example.com/.well-known/masque/udp/1.2.3.4/53/")
+				return u
+			}(),
+		}
+
+		got, err := srv.ParseRequest(req)
+		if err != nil {
+			t.Fatalf("parse request error: %v", err)
+		}
+		if got != "1.2.3.4:53" {
+			t.Fatalf("unexpected request: %s", got)
+		}
+	})
+
+	t.Run("reject http3 bind request", func(t *testing.T) {
+		srv, err := newUDPProxyServer("https://{host}/.well-known/masque/udp/{target_host}/{target_port}/", zap.NewNop())
+		if err != nil {
+			t.Fatalf("new proxy server error: %v", err)
+		}
+
+		req := &http.Request{
+			Method:     http.MethodConnect,
+			ProtoMajor: 3,
+			Proto:      RequestProtocol,
+			Header: http.Header{
+				ConnectUDPBindHeader: []string{ConnectUDPBindHeaderValue},
+			},
+			URL: func() *url.URL {
+				u, _ := url.Parse("https://example.com/.well-known/masque/udp/*/*/")
+				return u
+			}(),
+		}
+
+		if _, err := srv.ParseRequest(req); err == nil {
+			t.Fatal("expected unsupported http3 bind error")
 		}
 	})
 }
